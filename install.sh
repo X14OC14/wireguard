@@ -52,13 +52,23 @@ banner() {
   [ -t 1 ] && clear
   echo "${W}${C}"
   echo "  ╔══════════════════════════════════════════╗"
-  echo "  ║          WireGuard Manager v$VERSION         ║"
+  echo "  ║          WireGuard Manager v$VERSION          ║"
   echo "  ╚══════════════════════════════════════════╝"
   echo "${N}"
 }
 
 need_root() {
   [ "$(id -u)" -eq 0 ] || { err "Jalankan sebagai root (sudo su / sudo bash $0)."; exit 1; }
+}
+
+# Pasang perintah "wgmenu" kalau belum ada (dari file lokal atau unduh dari GitHub)
+ensure_selfbin() {
+  [ -x "$SELF_BIN" ] && return 0
+  if [ -f "$0" ] && install -m 755 "$0" "$SELF_BIN" 2>/dev/null; then :
+  elif curl -fsSL "$SCRIPT_URL" -o "$SELF_BIN" 2>/dev/null; then chmod 755 "$SELF_BIN"
+  fi
+  if [ -x "$SELF_BIN" ]; then ok "Perintah ${W}wgmenu${N} terpasang. Buka menu kapan saja dengan: wgmenu"; sleep 1; fi
+  return 0
 }
 
 # ---------- helper ----------
@@ -816,12 +826,7 @@ install_wg() {
 
   add_client "$first"
 
-  if [ "$(readlink -f "$0" 2>/dev/null)" != "$SELF_BIN" ]; then
-    if [ -f "$0" ] && install -m 755 "$0" "$SELF_BIN" 2>/dev/null; then :
-    elif curl -fsSL "$SCRIPT_URL" -o "$SELF_BIN" 2>/dev/null; then chmod 755 "$SELF_BIN"
-    fi
-  fi
-  [ -x "$SELF_BIN" ] && ok "Menu bisa dibuka lagi dengan perintah: ${W}wgmenu${N}"
+  ensure_selfbin
 
   echo
   echo "${W}${Y}PENTING - jangan lupa:${N}"
@@ -890,6 +895,7 @@ main() {
   if [ ! -t 0 ] && (: </dev/tty) 2>/dev/null; then exec </dev/tty; fi
 
   refresh_state
+  ensure_selfbin
   case "${1:-}" in
     add)  require_managed || exit 1; add_client "${2:-}"; exit 0 ;;
     list) require_managed || exit 1; list_clients; exit 0 ;;
