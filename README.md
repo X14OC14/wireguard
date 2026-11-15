@@ -14,7 +14,7 @@ Script interaktif untuk memasang dan mengelola VPN [WireGuard](https://www.wireg
 - Pengaturan endpoint (domain atau IP), port, DNS, MTU, dan pencegahan kebocoran IPv6
 - Perubahan config diterapkan **atomik dengan rollback otomatis**: kalau gagal, config sebelumnya dikembalikan
 - Validasi input: subnet (termasuk cek bentrok dengan route VPS), port, interface, DNS, MTU, dan endpoint
-- Lock file, jadi dua sesi `wgmenu` tidak bisa saling menimpa
+- Lock file, jadi dua sesi `wgmenu` tidak bisa saling menimpa. Kalau sesi lama menggantung (misalnya SSH putus), script menawarkan untuk mematikannya dan mengambil alih
 - Saat impor, pengaturan lama yang tidak ikut dipertahankan ditampilkan dulu sebelum lanjut
 - Backup config, update script dari GitHub, dan uninstall
 
