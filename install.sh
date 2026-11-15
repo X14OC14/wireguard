@@ -7,11 +7,12 @@
 # ==============================================================
 set -uo pipefail
 
-VERSION="2.0"
+VERSION="2.1"
 BASE=/etc/wireguard
 CLIENTS=$BASE/clients
 PARAMS=$BASE/params
 SELF_BIN=/usr/local/bin/wgmenu
+LOCK_FILE=/var/lock/wgmenu.lock
 SCRIPT_URL="https://raw.githubusercontent.com/X14OC14/wireguard/main/install.sh"
 
 R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'; W=$'\e[1m'; N=$'\e[0m'
@@ -20,6 +21,7 @@ ENDPOINT=""; PORT=""; SUBNET=""; DNS="1.1.1.1"; NIC=""; MTU=""; IPV6BLOCK="n"
 STATE="none"      # none | manual | managed
 CHOSEN=""; RENAMED=""
 NAMES=()
+IMP_WARNS=()
 
 info() { echo "${C}[i]${N} $*"; }
 ok()   { echo "${G}[✓]${N} $*"; }
@@ -37,6 +39,16 @@ ask() {
     read -rp "$__p: " __in || exit 0
   fi
   printf -v "$__v" '%s' "$__in"
+}
+
+# ask_valid VAR "Pertanyaan" "default" validator "pesan jika salah"
+ask_valid() {
+  local __v=$1 __p=$2 __d=$3 __f=$4 __h=$5 __t
+  while true; do
+    ask __t "$__p" "$__d"
+    if "$__f" "$__t"; then printf -v "$__v" '%s' "$__t"; return 0; fi
+    err "$__h"
+  done
 }
 
 # confirm "Pertanyaan" y|n   (default)
@@ -61,6 +73,16 @@ need_root() {
   [ "$(id -u)" -eq 0 ] || { err "Jalankan sebagai root (sudo su / sudo bash $0)."; exit 1; }
 }
 
+# Cegah dua sesi wgmenu berjalan bersamaan
+acquire_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 9>"$LOCK_FILE" || return 0
+  if ! flock -n 9; then
+    err "Ada wgmenu lain yang sedang berjalan. Tutup sesi itu dulu, lalu coba lagi."
+    exit 1
+  fi
+}
+
 # Pasang perintah "wgmenu" kalau belum ada (dari file lokal atau unduh dari GitHub)
 ensure_selfbin() {
   [ -x "$SELF_BIN" ] && return 0
@@ -69,6 +91,73 @@ ensure_selfbin() {
   fi
   if [ -x "$SELF_BIN" ]; then ok "Perintah ${W}wgmenu${N} terpasang. Buka menu kapan saja dengan: wgmenu"; sleep 1; fi
   return 0
+}
+
+# ---------- validasi ----------
+valid_ipv4() {
+  local ip=$1 o
+  [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  local IFS=.
+  for o in $ip; do [ "$((10#$o))" -le 255 ] || return 1; done
+  return 0
+}
+
+valid_subnet3() {
+  local s=$1 o
+  [[ $s =~ ^[0-9]{1,3}(\.[0-9]{1,3}){2}$ ]] || return 1
+  local IFS=.
+  for o in $s; do [ "$((10#$o))" -le 255 ] || return 1; done
+  return 0
+}
+
+valid_port() { [[ ${1:-} =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+valid_key() { [[ ${1:-} =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
+
+valid_nic() { [ -n "${1:-}" ] && [[ $1 =~ ^[A-Za-z0-9_.:-]+$ ]] && [ -d "/sys/class/net/$1" ]; }
+
+valid_mtu() { [ -z "${1:-}" ] || { [[ $1 =~ ^[0-9]{4}$ ]] && [ "$1" -ge 1280 ] && [ "$1" -le 1500 ]; }; }
+
+valid_dns() {
+  local list=${1//,/ } x
+  [ -n "${list// /}" ] || return 1
+  for x in $list; do
+    if valid_ipv4 "$x"; then continue
+    elif [[ $x == *:* && $x =~ ^[0-9A-Fa-f:]+$ && $x =~ :.*: ]]; then continue
+    else return 1; fi
+  done
+  return 0
+}
+
+valid_endpoint() {
+  local e=${1:-}
+  [ -n "$e" ] || return 1
+  if [[ $e =~ ^[0-9.]+$ ]]; then valid_ipv4 "$e"; return; fi
+  [ "${#e}" -le 253 ] && [[ $e =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]]
+}
+
+ip2int() {
+  local IFS=. p
+  read -ra p <<< "$1"
+  echo $(( (10#${p[0]} << 24) + (10#${p[1]} << 16) + (10#${p[2]} << 8) + 10#${p[3]} ))
+}
+
+# subnet_conflict a.b.c  -> cetak route yang bentrok dengan a.b.c.0/24, return 0 kalau bentrok
+subnet_conflict() {
+  local t r p m rn mask
+  t=$(ip2int "$1.0")
+  while read -r r; do
+    [ -z "$r" ] || [ "$r" = default ] && continue
+    [[ $r == */* ]] || r="$r/32"
+    p=${r##*/}; r=${r%/*}
+    [[ $r =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+    [[ $p =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] || continue
+    m=$p; [ "$m" -gt 24 ] && m=24
+    mask=$(( (0xFFFFFFFF << (32 - m)) & 0xFFFFFFFF ))
+    rn=$(ip2int "$r")
+    if [ $(( t & mask )) -eq $(( rn & mask )) ]; then echo "$r/$p"; return 0; fi
+  done < <(ip -4 route show 2>/dev/null | grep -v ' dev wg0' | awk '{print $1}')
+  return 1
 }
 
 # ---------- helper ----------
@@ -153,15 +242,25 @@ load_names() {
   return 0
 }
 
-# ---------- server config (dibangun dari folder clients/) ----------
-rebuild_server_conf() {
-  local d n
+# ---------- server config: build -> validasi -> ganti atomik -> rollback ----------
+# build_server_conf FILE : tulis config server (dari folder clients/) ke FILE
+build_server_conf() {
+  local out=$1 d n pk skey
+  skey=$(cat "$BASE/server_private.key" 2>/dev/null)
+  valid_key "$skey" || { err "server_private.key tidak valid."; return 1; }
+  for d in "$CLIENTS"/*/; do
+    [ -f "${d}ip" ] || continue
+    n=$(basename "$d")
+    pk=$(cat "${d}public.key" 2>/dev/null)
+    valid_key "$pk" || { err "Public key user '$n' tidak valid."; return 1; }
+    valid_ipv4 "$(cat "${d}ip")" || { err "IP user '$n' tidak valid."; return 1; }
+  done
   ( umask 077
     {
       echo "[Interface]"
       echo "Address = ${SUBNET}.1/24"
       echo "ListenPort = $PORT"
-      echo "PrivateKey = $(cat "$BASE/server_private.key")"
+      echo "PrivateKey = $skey"
       echo "PostUp = iptables -I FORWARD 1 -i wg0 -j ACCEPT; iptables -I FORWARD 1 -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -s ${SUBNET}.0/24 -o $NIC -j MASQUERADE"
       echo "PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -s ${SUBNET}.0/24 -o $NIC -j MASQUERADE"
       for d in "$CLIENTS"/*/; do
@@ -175,17 +274,44 @@ rebuild_server_conf() {
         [ -f "${d}psk.key" ] && echo "PresharedKey = $(cat "${d}psk.key")"
         echo "AllowedIPs = $(cat "${d}ip")/32"
       done
-    } > "$BASE/wg0.conf"
-  )
+    } > "$out"
+  ) || return 1
 }
 
-apply_conf() {
-  rebuild_server_conf
-  if is_up; then
-    wg syncconf wg0 <(wg-quick strip wg0)
-  else
-    systemctl start wg-quick@wg0
+# Bangun config baru di file sementara, validasi, lalu ganti wg0.conf (versi lama disimpan di wg0.conf.prev)
+install_server_conf() {
+  local new="$BASE/wg0-new.conf"
+  build_server_conf "$new" || { rm -f "$new"; return 1; }
+  if ! wg-quick strip wg0-new >/dev/null 2>&1; then
+    err "Config server hasil build tidak valid. Dibatalkan, config lama tidak diubah."
+    rm -f "$new"; return 1
   fi
+  [ -f "$BASE/wg0.conf" ] && cp -a "$BASE/wg0.conf" "$BASE/wg0.conf.prev"
+  mv -f "$new" "$BASE/wg0.conf"
+}
+
+restore_prev_conf() {
+  if [ -f "$BASE/wg0.conf.prev" ]; then mv -f "$BASE/wg0.conf.prev" "$BASE/wg0.conf"; return 0; fi
+  return 1
+}
+
+# Terapkan ke WireGuard yang sedang berjalan. Gagal -> config sebelumnya dikembalikan.
+apply_conf() {
+  install_server_conf || return 1
+  if is_up; then
+    if ! wg syncconf wg0 <(wg-quick strip wg0); then
+      err "Gagal menerapkan config. Mengembalikan config sebelumnya..."
+      if restore_prev_conf; then wg syncconf wg0 <(wg-quick strip wg0) >/dev/null 2>&1; fi
+      return 1
+    fi
+  else
+    if ! systemctl start wg-quick@wg0; then
+      err "Gagal menjalankan WireGuard. Mengembalikan config sebelumnya..."
+      restore_prev_conf
+      return 1
+    fi
+  fi
+  return 0
 }
 
 # ---------- client ----------
@@ -199,6 +325,20 @@ next_ip() {
     if [ $used -eq 0 ]; then echo "${SUBNET}.$i"; return 0; fi
   done
   return 1
+}
+
+# gen_client_keys DIR : buat private/public/psk, cek hasilnya, baru tulis ke DIR
+gen_client_keys() {
+  local d=$1 priv pub psk
+  priv=$(wg genkey 2>/dev/null) || return 1
+  pub=$(printf '%s' "$priv" | wg pubkey 2>/dev/null) || return 1
+  psk=$(wg genpsk 2>/dev/null) || return 1
+  valid_key "$priv" && valid_key "$pub" && valid_key "$psk" || return 1
+  ( umask 077
+    printf '%s\n' "$priv" > "$d/private.key"
+    printf '%s\n' "$pub"  > "$d/public.key"
+    printf '%s\n' "$psk"  > "$d/psk.key"
+  )
 }
 
 write_client_conf() {
@@ -260,33 +400,44 @@ add_client() {
   [[ $n =~ ^[A-Za-z0-9_-]{1,15}$ ]] || { err "Nama tidak valid."; return 1; }
   [ -d "$CLIENTS/$n" ] && { err "User '$n' sudah ada."; return 1; }
   cip=$(next_ip) || { err "Tidak ada IP kosong di subnet."; return 1; }
-  ( umask 077
-    mkdir -p "$CLIENTS/$n"
-    wg genkey | tee "$CLIENTS/$n/private.key" | wg pubkey > "$CLIENTS/$n/public.key"
-    wg genpsk > "$CLIENTS/$n/psk.key"
-    echo "$cip" > "$CLIENTS/$n/ip"
-  )
+  ( umask 077; mkdir -p "$CLIENTS/$n" ) || { err "Gagal membuat folder user."; return 1; }
+  if ! gen_client_keys "$CLIENTS/$n"; then
+    err "Gagal membuat key (wg genkey / wg pubkey / wg genpsk). User dibatalkan."
+    rm -rf "${CLIENTS:?}/$n"; return 1
+  fi
+  echo "$cip" > "$CLIENTS/$n/ip"
   write_client_conf "$n"
-  apply_conf
+  if ! apply_conf; then
+    err "User '$n' dibatalkan karena config gagal diterapkan."
+    rm -rf "${CLIENTS:?}/$n"; return 1
+  fi
   ok "User '$n' dibuat dengan IP $cip"
   show_qr "$n"
 }
 
 remove_client() {
-  local n=$1
+  local n=$1 trash="$BASE/.trash-$1"
   confirm "Hapus user '$n' permanen?" n || return 1
-  rm -rf "${CLIENTS:?}/$n"
-  apply_conf
-  ok "User '$n' dihapus."
-  return 0
+  rm -rf "$trash"
+  mv "$CLIENTS/$n" "$trash" || { err "Gagal memindahkan data user."; return 1; }
+  if apply_conf; then
+    rm -rf "$trash"
+    ok "User '$n' dihapus."
+    return 0
+  fi
+  mv "$trash" "$CLIENTS/$n"
+  err "Gagal menerapkan config, user '$n' dikembalikan."
+  return 1
 }
 
 toggle_client() {
-  local n=$1
-  if [ -f "$CLIENTS/$n/disabled" ]; then
-    rm -f "$CLIENTS/$n/disabled"; apply_conf; ok "User '$n' diaktifkan."
+  local n=$1 f="$CLIENTS/$1/disabled"
+  if [ -f "$f" ]; then
+    rm -f "$f"
+    if apply_conf; then ok "User '$n' diaktifkan."; else touch "$f"; err "Gagal mengaktifkan user (dikembalikan)."; return 1; fi
   else
-    touch "$CLIENTS/$n/disabled"; apply_conf; ok "User '$n' dinonaktifkan (config tetap tersimpan)."
+    touch "$f"
+    if apply_conf; then ok "User '$n' dinonaktifkan (config tetap tersimpan)."; else rm -f "$f"; err "Gagal menonaktifkan user (dikembalikan)."; return 1; fi
   fi
 }
 
@@ -297,20 +448,32 @@ rename_client() {
   [ -e "$CLIENTS/$new" ] && { err "Nama '$new' sudah dipakai."; return 1; }
   mv "$CLIENTS/$old" "$CLIENTS/$new"
   [ -f "$CLIENTS/$new/$old.conf" ] && mv "$CLIENTS/$new/$old.conf" "$CLIENTS/$new/$new.conf"
-  apply_conf
+  if ! apply_conf; then
+    [ -f "$CLIENTS/$new/$new.conf" ] && mv "$CLIENTS/$new/$new.conf" "$CLIENTS/$new/$old.conf"
+    mv "$CLIENTS/$new" "$CLIENTS/$old"
+    err "Gagal menerapkan config, nama dikembalikan."
+    return 1
+  fi
   RENAMED=$new
   ok "Nama diganti: $old -> $new"
 }
 
 reset_client() {
-  local n=$1
+  local n=$1 bak="$BASE/.bak-reset-$1"
   confirm "Buat ulang key '$n'? Config lama di perangkat akan berhenti bekerja." n || return 1
-  ( umask 077
-    wg genkey | tee "$CLIENTS/$n/private.key" | wg pubkey > "$CLIENTS/$n/public.key"
-    wg genpsk > "$CLIENTS/$n/psk.key"
-  )
+  rm -rf "$bak"
+  cp -a "$CLIENTS/$n" "$bak" || { err "Gagal membuat cadangan user."; return 1; }
+  if ! gen_client_keys "$CLIENTS/$n"; then
+    err "Gagal membuat key baru. Key lama tidak diubah."
+    rm -rf "$bak"; return 1
+  fi
   write_client_conf "$n"
-  apply_conf
+  if ! apply_conf; then
+    rm -rf "${CLIENTS:?}/$n"; mv "$bak" "$CLIENTS/$n"
+    err "Gagal menerapkan config, key lama dikembalikan."
+    return 1
+  fi
+  rm -rf "$bak"
   ok "Key '$n' dibuat ulang. Pasang config baru di perangkat:"
   show_qr "$n"
 }
@@ -461,35 +624,52 @@ status_menu() {
 
 # ---------- pengaturan ----------
 change_endpoint() {
+  local new
   info "Endpoint sekarang: $ENDPOINT:$PORT"
-  ask ENDPOINT "Endpoint baru (domain / IP)" "$ENDPOINT"
+  ask_valid new "Endpoint baru (domain / IPv4)" "$ENDPOINT" valid_endpoint "Isi domain (contoh vpn.contoh.com) atau IPv4 yang valid."
+  ENDPOINT=$new
   save_params; regen_all
   ok "Endpoint diperbarui di semua config."
 }
 
 change_port() {
   local old=$PORT new
-  while true; do
-    ask new "Port UDP baru" "$PORT"
-    [[ $new =~ ^[0-9]+$ ]] && [ "$new" -ge 1 ] && [ "$new" -le 65535 ] && break
-    err "Port harus angka 1-65535."
-  done
+  ask_valid new "Port UDP baru" "$PORT" valid_port "Port harus angka 1-65535."
   [ "$new" = "$old" ] && { info "Port tidak berubah."; return 0; }
   PORT=$new
-  if ufw_active; then
-    ufw allow "$PORT/udp" >/dev/null && ufw delete allow "$old/udp" >/dev/null 2>&1
-    ok "UFW: buka $PORT/udp, tutup $old/udp"
+  if ! install_server_conf; then PORT=$old; err "Port tidak diubah."; return 1; fi
+  if ufw_active; then ufw allow "$PORT/udp" >/dev/null; fi
+  if ! systemctl restart wg-quick@wg0; then
+    err "WireGuard gagal restart dengan port baru. Mengembalikan pengaturan lama..."
+    restore_prev_conf
+    if ufw_active; then ufw delete allow "$PORT/udp" >/dev/null 2>&1; fi
+    PORT=$old
+    systemctl restart wg-quick@wg0
+    return 1
   fi
-  save_params; regen_all; rebuild_server_conf
-  systemctl restart wg-quick@wg0 && ok "Port diubah ke $PORT dan WireGuard di-restart."
+  if ufw_active; then ufw delete allow "$old/udp" >/dev/null 2>&1; fi
+  save_params; regen_all
+  ok "Port diubah ke $PORT dan WireGuard di-restart."
   warn "Buka UDP $PORT di firewall cloud (Lightsail/Security Group) kalau belum tercakup."
 }
 
-change_dns() { ask DNS "DNS baru (contoh: 1.1.1.1, 1.0.0.1)" "$DNS"; save_params; regen_all; ok "DNS diperbarui."; }
-change_mtu() { ask MTU "MTU baru (kosongkan = default, mis. 1280)" "$MTU"; save_params; regen_all; ok "MTU diperbarui."; }
+change_dns() {
+  local new
+  ask_valid new "DNS baru (contoh: 1.1.1.1, 1.0.0.1)" "$DNS" valid_dns "DNS harus berupa IP (pisahkan dengan koma)."
+  DNS=$new; save_params; regen_all; ok "DNS diperbarui."
+}
+
+change_mtu() {
+  local new
+  ask_valid new "MTU baru (1280-1500, kosongkan = default)" "$MTU" valid_mtu "MTU harus angka 1280-1500 atau kosong."
+  MTU=$new; save_params; regen_all; ok "MTU diperbarui."
+}
+
 toggle_ipv6() {
   if [ "$IPV6BLOCK" = y ]; then IPV6BLOCK=n; else IPV6BLOCK=y; fi
-  save_params; regen_all; ok "Blok IPv6: $IPV6BLOCK"
+  save_params; regen_all
+  ok "Pencegahan kebocoran IPv6: $IPV6BLOCK"
+  info "Kalau aktif, trafik IPv6 perangkat diarahkan ke tunnel lalu dibuang server (server ini IPv4 saja)."
 }
 
 settings_menu() {
@@ -497,16 +677,16 @@ settings_menu() {
   local m
   while true; do
     banner
-    echo "  Endpoint  : $ENDPOINT:$PORT"
-    echo "  DNS       : $DNS"
-    echo "  MTU       : ${MTU:-default}"
-    echo "  Blok IPv6 : $IPV6BLOCK"
+    echo "  Endpoint           : $ENDPOINT:$PORT"
+    echo "  DNS                : $DNS"
+    echo "  MTU                : ${MTU:-default}"
+    echo "  Cegah bocor IPv6   : $IPV6BLOCK"
     echo
     echo "  ${W}1${N}) Ubah endpoint (domain / IP)"
     echo "  ${W}2${N}) Ubah port"
     echo "  ${W}3${N}) Ubah DNS"
     echo "  ${W}4${N}) Ubah MTU"
-    echo "  ${W}5${N}) Blok IPv6 on/off"
+    echo "  ${W}5${N}) Cegah kebocoran IPv6 on/off"
     echo "  ${W}0${N}) Kembali"
     echo
     read -rp "Pilih [0-5]: " m || exit 0
@@ -588,13 +768,15 @@ uninstall_wg() {
   if command -v ufw >/dev/null 2>&1; then ufw delete allow "$PORT/udp" >/dev/null 2>&1; fi
   rm -f /etc/sysctl.d/99-wireguard.conf
   if confirm "Hapus juga semua key & data user di $BASE?" n; then
-    rm -rf "${CLIENTS:?}" "$BASE/wg0.conf" "$PARAMS" "$BASE"/server_*.key
-    ok "Data dihapus."
+    rm -rf "${CLIENTS:?}" "$BASE/wg0.conf" "$BASE/wg0.conf.prev" "$PARAMS" "$BASE"/server_*.key
+    rm -f "$SELF_BIN"
+    ok "Data dan perintah wgmenu dihapus."
+  else
+    info "Data tetap tersimpan. Jalankan 'wgmenu' lagi kalau mau mengaktifkannya kembali."
   fi
   if confirm "Hapus paket wireguard dari sistem?" n; then
     apt-get remove -y wireguard wireguard-tools >/dev/null 2>&1
   fi
-  rm -f "$SELF_BIN"
   ok "Uninstall selesai."
   exit 0
 }
@@ -602,10 +784,51 @@ uninstall_wg() {
 # ---------- impor setup yang sudah ada ----------
 IMP_NAME=""; IMP_PUB=""; IMP_AIP=""; IMP_PSK=""; IMP_COUNT=0
 
+# scan_import FILE : kumpulkan hal-hal di wg0.conf lama yang TIDAK akan dipertahankan
+scan_import() {
+  local conf=$1 line sect="" key val cmd name="" parts
+  IMP_WARNS=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    line=${line#"${line%%[![:space:]]*}"}
+    case "$line" in
+      "") continue ;;
+      "[Interface]"*) sect=i; continue ;;
+      "[Peer]"*) sect=p; name=""; continue ;;
+      "#"*) if [ "$sect" = p ] && [ -z "$name" ]; then name=${line#\#}; name=${name# }; fi; continue ;;
+    esac
+    key=${line%%=*}; key=${key//[[:space:]]/}
+    val=$(echo "$line" | sed 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//')
+    if [ "$sect" = i ]; then
+      case "$key" in
+        PostUp|PostDown)
+          IFS=';' read -ra parts <<< "$val"
+          for cmd in "${parts[@]}"; do
+            cmd=${cmd#"${cmd%%[![:space:]]*}"}
+            [ -z "$cmd" ] && continue
+            [[ $cmd =~ ^iptables\ (-t\ nat\ )?-[AID]\ (FORWARD|POSTROUTING) ]] || IMP_WARNS+=("Server $key kustom akan diganti aturan standar: $cmd")
+          done ;;
+        PreUp|PreDown|SaveConfig|Table|FwMark|MTU|DNS)
+          IMP_WARNS+=("Server $key = $val tidak dipertahankan") ;;
+      esac
+    elif [ "$sect" = p ]; then
+      case "$key" in
+        AllowedIPs) [[ $val =~ ^[0-9.]+/32$ ]] || IMP_WARNS+=("Peer ${name:-?}: AllowedIPs '$val' dipersempit ke IP pertama (/32)") ;;
+        PersistentKeepalive|Endpoint) IMP_WARNS+=("Peer ${name:-?}: $key = $val tidak dipertahankan") ;;
+      esac
+    fi
+  done < "$conf"
+}
+
 imp_flush() {
   [ -n "$IMP_PUB" ] && [ -n "$IMP_AIP" ] || return 0
   local aip=${IMP_AIP%%,*} cip n base i=1
   cip=${aip%%/*}
+  if ! valid_key "$IMP_PUB" || ! valid_ipv4 "$cip"; then
+    warn "Peer '${IMP_NAME:-?}' dilewati (public key atau IP tidak valid)."
+    IMP_NAME=""; IMP_PUB=""; IMP_AIP=""; IMP_PSK=""
+    return 0
+  fi
   n=$(printf '%s' "${IMP_NAME:-peer}" | tr -c 'A-Za-z0-9_-' '_' | cut -c1-15)
   [ -n "$n" ] || n=peer
   base=$n
@@ -614,7 +837,7 @@ imp_flush() {
     mkdir -p "$CLIENTS/$n"
     echo "$IMP_PUB" > "$CLIENTS/$n/public.key"
     echo "$cip" > "$CLIENTS/$n/ip"
-    if [ -n "$IMP_PSK" ]; then echo "$IMP_PSK" > "$CLIENTS/$n/psk.key"; fi
+    if valid_key "$IMP_PSK"; then echo "$IMP_PSK" > "$CLIENTS/$n/psk.key"; fi
   )
   IMP_COUNT=$((IMP_COUNT+1))
   IMP_NAME=""; IMP_PUB=""; IMP_AIP=""; IMP_PSK=""
@@ -630,7 +853,7 @@ import_existing() {
     apt-get install -y -qq qrencode >/dev/null 2>&1 || warn "qrencode gagal dipasang (QR tidak akan tampil)."
   fi
 
-  local conf="$BASE/wg0.conf" addr spriv nic ip4 pubip line v f privk pubk d n matched=0 bk
+  local conf="$BASE/wg0.conf" addr spriv nic ip4 pubip line v f privk pubk d n matched=0 bk w
   PORT=$(sed -n 's/^ListenPort[[:space:]]*=[[:space:]]*//p' "$conf" | head -1 | tr -d '[:space:]')
   addr=$(sed -n 's/^Address[[:space:]]*=[[:space:]]*//p' "$conf" | head -1 | tr -d '[:space:]')
   spriv=$(sed -n 's/^PrivateKey[[:space:]]*=[[:space:]]*//p' "$conf" | head -1 | tr -d '[:space:]')
@@ -638,8 +861,8 @@ import_existing() {
   ip4=${addr%%,*}; ip4=${ip4%%/*}
   SUBNET=${ip4%.*}
 
-  if ! [[ $PORT =~ ^[0-9]+$ ]] || ! [[ $SUBNET =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || [ -z "$spriv" ]; then
-    err "wg0.conf tidak bisa dibaca (ListenPort / Address / PrivateKey tidak lengkap)."
+  if ! valid_port "$PORT" || ! valid_subnet3 "$SUBNET" || ! valid_key "$spriv"; then
+    err "wg0.conf tidak bisa dibaca (ListenPort / Address / PrivateKey tidak valid)."
     return 1
   fi
   case "$addr" in */24*) ;; *) warn "Subnet bukan /24. Script ini mengasumsikan /24." ;; esac
@@ -650,10 +873,21 @@ import_existing() {
   echo "  Interface : ${nic:-?}"
   echo "  Peer      : $(grep -c '^\[Peer\]' "$conf")"
   echo
+
+  scan_import "$conf"
+  if [ ${#IMP_WARNS[@]} -gt 0 ]; then
+    warn "Beberapa pengaturan lama TIDAK akan dipertahankan:"
+    for w in "${IMP_WARNS[@]}"; do echo "    - $w"; done
+    echo
+    info "Backup wg0.conf lama dibuat otomatis, jadi bisa dicek kembali."
+    confirm "Tetap lanjut impor?" n || { info "Dibatalkan."; return 0; }
+    echo
+  fi
+
   pubip=$(detect_ip)
-  ask ENDPOINT "Endpoint untuk config client (domain / IP)" "$pubip"
-  ask NIC "Interface internet server" "${nic:-$(detect_nic)}"
-  ask DNS "DNS client" "1.1.1.1"
+  ask_valid ENDPOINT "Endpoint untuk config client (domain / IPv4)" "$pubip" valid_endpoint "Isi domain (contoh vpn.contoh.com) atau IPv4 yang valid."
+  ask_valid NIC "Interface internet server" "${nic:-$(detect_nic)}" valid_nic "Interface tidak ditemukan (cek: ip link)."
+  ask_valid DNS "DNS client" "1.1.1.1" valid_dns "DNS harus berupa IP (pisahkan dengan koma)."
   MTU=""
   IPV6BLOCK=n
   echo
@@ -693,6 +927,7 @@ import_existing() {
     [ "$(basename "$f")" = wg0.conf ] && continue
     grep -q '^\[Interface\]' "$f" && grep -q '^PrivateKey' "$f" || continue
     privk=$(sed -n 's/^PrivateKey[[:space:]]*=[[:space:]]*//p' "$f" | head -1 | tr -d '[:space:]')
+    valid_key "$privk" || continue
     pubk=$(printf '%s' "$privk" | wg pubkey 2>/dev/null) || continue
     for d in "$CLIENTS"/*/; do
       [ -f "${d}public.key" ] || continue
@@ -708,8 +943,12 @@ import_existing() {
 
   save_params
   refresh_state
-  rebuild_server_conf
-  if is_up; then wg syncconf wg0 <(wg-quick strip wg0); else systemctl start wg-quick@wg0; fi
+  if ! apply_conf; then
+    err "Impor dibatalkan: config baru gagal diterapkan. Config lama dikembalikan."
+    rm -f "$PARAMS"; rm -rf "${CLIENTS:?}"
+    refresh_state
+    return 1
+  fi
   systemctl enable wg-quick@wg0 >/dev/null 2>&1
 
   ok "Impor selesai: $IMP_COUNT user dibaca, $matched config client berhasil dicocokkan."
@@ -736,21 +975,14 @@ install_wg() {
   echo "Tekan Enter untuk memakai nilai default [dalam kurung]."
   echo
 
-  local pubip first
+  local pubip first c
   info "Mendeteksi IP publik..."
   pubip=$(detect_ip)
   if [ -n "$pubip" ]; then ok "IP publik terdeteksi: $pubip"; else warn "IP publik tidak terdeteksi, isi manual."; fi
 
-  ENDPOINT=""
-  while [ -z "$ENDPOINT" ]; do
-    ask ENDPOINT "1) Endpoint server (domain atau IP publik)" "$pubip"
-  done
+  ask_valid ENDPOINT "1) Endpoint server (domain atau IPv4 publik)" "$pubip" valid_endpoint "Isi domain (contoh vpn.contoh.com) atau IPv4 yang valid."
 
-  while true; do
-    ask PORT "2) Port UDP WireGuard" "51820"
-    [[ $PORT =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] && break
-    err "Port harus angka 1-65535."
-  done
+  ask_valid PORT "2) Port UDP WireGuard" "51820" valid_port "Port harus angka 1-65535."
   if ss -lun 2>/dev/null | grep -q ":$PORT "; then
     warn "Port UDP $PORT sepertinya sudah dipakai proses lain."
     confirm "Tetap lanjut?" n || return 0
@@ -758,15 +990,21 @@ install_wg() {
 
   while true; do
     ask SUBNET "3) Subnet VPN (3 oktet pertama, dipakai sebagai /24)" "10.8.0"
-    [[ $SUBNET =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && break
-    err "Format salah. Contoh: 10.8.0"
+    if ! valid_subnet3 "$SUBNET"; then err "Format salah atau ada oktet > 255. Contoh: 10.8.0"; continue; fi
+    if c=$(subnet_conflict "$SUBNET"); then err "Subnet ${SUBNET}.0/24 bentrok dengan route yang ada ($c). Pilih subnet lain."; continue; fi
+    case "$SUBNET" in
+      10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) ;;
+      *) warn "Subnet di luar rentang IP privat (10/8, 172.16/12, 192.168/16)."
+         confirm "Tetap pakai?" n || continue ;;
+    esac
+    break
   done
 
   NIC=$(detect_nic)
-  ask NIC "4) Interface jaringan internet server" "${NIC:-eth0}"
-  ask DNS "5) DNS untuk client" "1.1.1.1"
-  if confirm "6) Cegah kebocoran IPv6 (blokir IPv6 lewat tunnel)?" y; then IPV6BLOCK=y; else IPV6BLOCK=n; fi
-  ask MTU "7) MTU (kosongkan untuk default, coba 1280 jika koneksi aneh)" ""
+  ask_valid NIC "4) Interface jaringan internet server" "${NIC:-eth0}" valid_nic "Interface tidak ditemukan (cek: ip link)."
+  ask_valid DNS "5) DNS untuk client" "1.1.1.1" valid_dns "DNS harus berupa IP (pisahkan dengan koma)."
+  if confirm "6) Cegah kebocoran IPv6 (trafik IPv6 diarahkan ke tunnel lalu dibuang)?" y; then IPV6BLOCK=y; else IPV6BLOCK=n; fi
+  ask_valid MTU "7) MTU 1280-1500 (kosongkan untuk default, coba 1280 jika koneksi aneh)" "" valid_mtu "MTU harus angka 1280-1500 atau kosong."
 
   while true; do
     ask first "8) Nama user pertama (maks 15 karakter: huruf/angka/-/_)" "hp"
@@ -776,13 +1014,13 @@ install_wg() {
 
   echo
   echo "${W}Ringkasan:${N}"
-  echo "  Endpoint   : $ENDPOINT:$PORT"
-  echo "  Subnet     : ${SUBNET}.0/24 (server ${SUBNET}.1)"
-  echo "  Interface  : $NIC"
-  echo "  DNS        : $DNS"
-  echo "  Blok IPv6  : $IPV6BLOCK"
-  echo "  MTU        : ${MTU:-default}"
-  echo "  User awal  : $first"
+  echo "  Endpoint     : $ENDPOINT:$PORT"
+  echo "  Subnet       : ${SUBNET}.0/24 (server ${SUBNET}.1)"
+  echo "  Interface    : $NIC"
+  echo "  DNS          : $DNS"
+  echo "  Cegah IPv6   : $IPV6BLOCK"
+  echo "  MTU          : ${MTU:-default}"
+  echo "  User awal    : $first"
   echo
   confirm "Lanjut install?" y || { info "Dibatalkan."; pause; return 0; }
 
@@ -817,15 +1055,17 @@ install_wg() {
     wg genkey | tee "$BASE/server_private.key" | wg pubkey > "$BASE/server_public.key"
   )
   chmod 700 "$BASE"
+  if ! valid_key "$(cat "$BASE/server_private.key" 2>/dev/null)" || ! valid_key "$(cat "$BASE/server_public.key" 2>/dev/null)"; then
+    err "Gagal membuat key server."; pause; return 1
+  fi
 
   save_params
   refresh_state
-  rebuild_server_conf
+  if ! install_server_conf; then err "Gagal membuat config server."; pause; return 1; fi
   systemctl enable --now wg-quick@wg0 >/dev/null 2>&1
   if is_up; then ok "WireGuard berjalan (wg0)."; else err "wg0 gagal start. Cek: journalctl -u wg-quick@wg0"; pause; return 1; fi
 
   add_client "$first"
-
   ensure_selfbin
 
   echo
@@ -895,10 +1135,13 @@ main() {
   if [ ! -t 0 ] && (: </dev/tty) 2>/dev/null; then exec </dev/tty; fi
 
   refresh_state
+  if [ "${1:-}" = list ]; then require_managed || exit 1; list_clients; exit 0; fi
+
+  acquire_lock
   ensure_selfbin
+
   case "${1:-}" in
-    add)  require_managed || exit 1; add_client "${2:-}"; exit 0 ;;
-    list) require_managed || exit 1; list_clients; exit 0 ;;
+    add) require_managed || exit 1; add_client "${2:-}"; exit 0 ;;
   esac
 
   main_menu
