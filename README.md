@@ -11,7 +11,11 @@ Script interaktif untuk memasang dan mengelola VPN [WireGuard](https://www.wireg
 - QR code dan file config per user, lengkap dengan preshared key
 - Tabel status user: handshake terakhir dan pemakaian data
 - Diagnostik: service, port, IP forwarding, UFW, NAT, dan DNS domain
-- Pengaturan endpoint (domain atau IP), port, DNS, MTU, dan blok IPv6
+- Pengaturan endpoint (domain atau IP), port, DNS, MTU, dan pencegahan kebocoran IPv6
+- Perubahan config diterapkan **atomik dengan rollback otomatis**: kalau gagal, config sebelumnya dikembalikan
+- Validasi input: subnet (termasuk cek bentrok dengan route VPS), port, interface, DNS, MTU, dan endpoint
+- Lock file, jadi dua sesi `wgmenu` tidak bisa saling menimpa
+- Saat impor, pengaturan lama yang tidak ikut dipertahankan ditampilkan dulu sebelum lanjut
 - Backup config, update script dari GitHub, dan uninstall
 
 ## Kebutuhan
@@ -56,7 +60,7 @@ wgmenu list         # daftar user dan status
 | 3 | Daftar user & atur | Tabel user, lalu pilih nomor untuk QR, config, nonaktifkan, ganti nama, reset key, hapus |
 | 4 | Tambah user | Buat user baru dan tampilkan QR |
 | 5 | Status & diagnostik | Cek kesehatan server beserta saran perbaikan |
-| 6 | Pengaturan | Endpoint, port, DNS, MTU, blok IPv6 |
+| 6 | Pengaturan | Endpoint, port, DNS, MTU, pencegahan kebocoran IPv6 |
 | 7 | Service | Start, stop, restart, auto-start saat boot |
 | 8 | Backup config | Arsip `.tar.gz` di `/root` |
 | 9 | Update script | Unduh versi terbaru dari GitHub |
@@ -74,7 +78,8 @@ wgmenu list         # daftar user dan status
 
 1. Jalankan script, pilih **2**
 2. Script membaca `wg0.conf`, mengimpor semua peer, dan mencocokkan file config client lama lewat public key
-3. Config lama dibackup otomatis dulu, dan koneksi yang sedang berjalan tidak diputus
+3. Kalau wg0.conf lama punya pengaturan yang tidak dipertahankan (PostUp kustom, AllowedIPs lebih dari satu, PersistentKeepalive peer), script menampilkannya dulu dan meminta konfirmasi
+4. Config lama dibackup otomatis, dan koneksi yang sedang berjalan tidak diputus
 
 **Membagikan ke teman**
 
@@ -93,6 +98,7 @@ Catatan: nama tunnel di app Android maksimal 15 karakter (huruf, angka, dan `_ =
 ```
 /etc/wireguard/
 ├── wg0.conf              # dibuat ulang otomatis oleh script, jangan diedit manual
+├── wg0.conf.prev         # versi sebelumnya (dipakai untuk rollback)
 ├── params                # pengaturan (endpoint, port, subnet, DNS, dst)
 ├── server_private.key
 ├── server_public.key
@@ -107,6 +113,8 @@ Catatan: nama tunnel di app Android maksimal 15 karakter (huruf, angka, dan `_ =
 ```
 
 `wg0.conf` dibangun dari folder `clients/`. Ubah user lewat menu, bukan dengan mengedit `wg0.conf` langsung.
+
+Setiap perubahan dibangun dulu ke file sementara, divalidasi, lalu menggantikan `wg0.conf`. Kalau penerapannya gagal, `wg0.conf.prev` dikembalikan otomatis dan perubahan user dibatalkan.
 
 ## Troubleshooting
 
@@ -136,6 +144,8 @@ Mulai dari menu **5 (Status & diagnostik)**, karena biasanya langsung menunjukka
 - QR dan file config berisi **private key**. Jangan dikirim ke grup atau diunggah ke tempat publik. Kalau bocor, pakai **Buat ulang key** di menu user.
 - Semua traffic user keluar lewat IP servermu, jadi aktivitas mereka tercatat atas IP tersebut. Bagikan hanya ke orang yang kamu percaya.
 - Saat ini sesama user VPN bisa saling menjangkau perangkat di dalam subnet VPN (tidak ada isolasi antar client).
+- Opsi "pencegahan kebocoran IPv6" mengarahkan trafik IPv6 perangkat ke tunnel lalu dibuang server (server ini IPv4 saja). Ini bukan dukungan IPv6.
+- Update dari GitHub (menu 9) mengunduh script tanpa verifikasi checksum. Amankan akun GitHub-mu dengan 2FA.
 - Traffic user memakai kuota transfer bulanan dari penyedia VPS-mu.
 
 ## Uninstall
