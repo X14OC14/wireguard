@@ -73,14 +73,36 @@ need_root() {
   [ "$(id -u)" -eq 0 ] || { err "Jalankan sebagai root (sudo su / sudo bash $0)."; exit 1; }
 }
 
-# Cegah dua sesi wgmenu berjalan bersamaan
+# Cegah dua sesi wgmenu berjalan bersamaan. Kalau sesi lama menggantung
+# (mis. SSH putus), tawarkan untuk mematikannya dan mengambil alih.
 acquire_lock() {
   command -v flock >/dev/null 2>&1 || return 0
-  exec 9>"$LOCK_FILE" || return 0
-  if ! flock -n 9; then
+  exec 9>>"$LOCK_FILE" || return 0
+  if flock -n 9; then echo $$ > "$LOCK_FILE"; return 0; fi
+
+  local pid tty up i
+  pid=$(head -1 "$LOCK_FILE" 2>/dev/null | tr -d '[:space:]')
+  # pastikan PID itu memang pemegang lock (bukan proses lain yang kebetulan memakai PID sama)
+  if [[ $pid =~ ^[0-9]+$ ]] && [ "$(readlink -f "/proc/$pid/fd/9" 2>/dev/null)" = "$(readlink -f "$LOCK_FILE")" ]; then
+    tty=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
+    up=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+    warn "Ada wgmenu lain yang sedang berjalan (PID $pid, terminal ${tty:-?}, sudah berjalan ${up:-?})."
+    if [ -t 0 ] && confirm "Matikan sesi itu dan ambil alih? (aman kalau SSH-mu tadi putus)" y; then
+      kill "$pid" 2>/dev/null
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        if flock -n 9; then echo $$ > "$LOCK_FILE"; ok "Sesi lama dimatikan, sesi ini mengambil alih."; return 0; fi
+        sleep 0.3
+      done
+      kill -9 "$pid" 2>/dev/null; sleep 0.5
+      if flock -n 9; then echo $$ > "$LOCK_FILE"; ok "Sesi lama dipaksa berhenti, sesi ini mengambil alih."; return 0; fi
+      err "Sesi lama belum mau berhenti. Coba: kill -9 $pid"
+    else
+      err "Dibatalkan. Tutup sesi lama dulu, atau jalankan wgmenu secara interaktif untuk mengambil alih."
+    fi
+  else
     err "Ada wgmenu lain yang sedang berjalan. Tutup sesi itu dulu, lalu coba lagi."
-    exit 1
   fi
+  exit 1
 }
 
 # Pasang perintah "wgmenu" kalau belum ada (dari file lokal atau unduh dari GitHub)
